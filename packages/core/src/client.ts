@@ -43,7 +43,7 @@ import { encodeBase64 } from './base64';
 import { LRUCache } from './cache';
 import type { CdsDiscoveryResponse, CdsRequest, CdsResponse } from './cds';
 import { ContentType } from './contenttype';
-import { encryptSHA256, getRandomString } from './crypto';
+import { encryptSHA256, generateId, getRandomString } from './crypto';
 import { isBrowserEnvironment, locationUtils } from './environment';
 import { TypedEventTarget } from './eventtarget';
 import type {
@@ -1050,6 +1050,8 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
   private accessTokenExpires?: number;
   private refreshToken?: string;
   private refreshPromise?: Promise<any>;
+  private sessionVersion?: string;
+  private sessionClearedFrom?: { previous: string | undefined; current: string | undefined };
   private profilePromise?: Promise<any>;
   private sessionDetails?: SessionDetails;
   private currentRateLimits?: string;
@@ -1071,6 +1073,8 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
     this.options = options ?? {};
     this.fetch = options?.fetch ?? getDefaultFetch();
     this.storage = options?.storage ?? new ClientStorage(undefined, options?.storagePrefix);
+    this.sessionVersion = this.storage.getString('sessionVersion');
+    const initialSessionVersion = this.sessionVersion;
     this.createPdfImpl = options?.createPdf;
     this.baseUrl = ensureTrailingSlash(options?.baseUrl ?? DEFAULT_BASE_URL);
     this.fhirBaseUrl = concatUrls(this.baseUrl, options?.fhirUrlPath ?? 'fhir/R4');
@@ -1106,7 +1110,7 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
     }
 
     if (options?.accessToken) {
-      this.setAccessToken(options.accessToken);
+      this.applyAccessToken(options.accessToken);
     }
 
     if (this.storage.getInitPromise === undefined) {
@@ -1120,8 +1124,11 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
       this.initPromise = this.storage.getInitPromise();
       this.initPromise
         .then(() => {
-          if (!options?.accessToken) {
-            this.attemptResumeActiveLogin().catch(console.error);
+          if (this.sessionVersion === initialSessionVersion) {
+            this.sessionVersion = this.storage.getString('sessionVersion');
+            if (!options?.accessToken) {
+              this.attemptResumeActiveLogin().catch(console.error);
+            }
           }
           this.initComplete = true;
           this.dispatchEvent({ type: 'storageInitialized' });
@@ -1171,7 +1178,7 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
     if (!activeLogin) {
       return;
     }
-    this.setAccessToken(activeLogin.accessToken, activeLogin.refreshToken);
+    this.applyAccessToken(activeLogin.accessToken, activeLogin.refreshToken);
     await this.refreshProfile();
   }
 
@@ -1266,13 +1273,39 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
    * @category Authentication
    */
   clearActiveLogin(): void {
-    this.storage.setString('activeLogin', undefined);
+    const previous = this.sessionVersion;
+    this.invalidateSession();
+    this.sessionClearedFrom = { previous, current: this.sessionVersion };
+    this.clearActiveLoginState();
+  }
+
+  private invalidateSession(): void {
+    // Non-secret invalidation marker shared by clients in this storage namespace.
+    // Persist it after clear() so a suspended peer also rejects old completions.
+    this.sessionClearedFrom = undefined;
+    this.sessionVersion = generateId();
+    this.storage.setString('sessionVersion', this.sessionVersion);
+    this.refreshPromise = undefined;
+    this.profilePromise = undefined;
+  }
+
+  private assertSessionVersion(version: string | undefined): void {
+    if (this.sessionVersion !== version || this.storage.getString('sessionVersion') !== version) {
+      throw new Error('Session changed while request was pending');
+    }
+  }
+
+  private clearActiveLoginState(clearStoredLogin = true): void {
+    if (clearStoredLogin) {
+      this.storage.setString('activeLogin', undefined);
+    }
     this.requestCache?.clear();
     this.accessToken = undefined;
     this.refreshToken = undefined;
     this.refreshPromise = undefined;
     this.accessTokenExpires = undefined;
     this.sessionDetails = undefined;
+    this.profilePromise = undefined;
     this.medplumServer = undefined;
     this.dispatchEvent({ type: 'change' });
   }
@@ -1595,12 +1628,43 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
 
   /**
    * Signs out the client.
-   * This revokes the current token and clears token from the local cache.
+   * Clears local authentication even if revocation fails or is aborted. A rejected
+   * promise does not confirm server revocation. A newer login is preserved.
+   * @param options - Request options, including an optional logout abort signal.
    * @category Authentication
    */
-  async signOut(): Promise<void> {
-    await this.post(this.logoutUrl, {});
-    this.clear();
+  async signOut(options?: MedplumRequestOptions): Promise<void> {
+    const version = this.sessionVersion;
+    const signal = options?.signal;
+    let onAbort: (() => void) | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        onAbort = () => reject(signal?.reason ?? new Error('Logout aborted'));
+        if (signal?.aborted) {
+          onAbort();
+          return;
+        }
+        signal?.addEventListener('abort', onAbort, { once: true });
+        // The abort listener also bounds refresh preflight, before fetch sees the signal.
+        this.post(this.logoutUrl, {}, ContentType.JSON, options).then(() => resolve(), reject);
+      });
+    } finally {
+      if (onAbort) {
+        signal?.removeEventListener('abort', onAbort);
+      }
+      // An old logout must never erase a login established while it was pending.
+      const clearedDuringLogout =
+        this.sessionClearedFrom?.previous === version &&
+        this.sessionClearedFrom !== undefined &&
+        this.sessionClearedFrom.current === this.sessionVersion;
+      if (this.sessionVersion === version || clearedDuringLogout) {
+        if (this.storage.getString('sessionVersion') === this.sessionVersion) {
+          this.clear();
+        } else {
+          this.clearActiveLoginState(false);
+        }
+      }
+    }
   }
 
   /**
@@ -3179,13 +3243,19 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
   /**
    * Sets the active login.
    * @param login - The new active login state.
+   * @returns Promise that resolves after the profile is loaded.
    * @category Authentication
    */
   async setActiveLogin(login: LoginState): Promise<void> {
+    this.invalidateSession();
+    return this.applyActiveLogin(login);
+  }
+
+  private async applyActiveLogin(login: LoginState): Promise<void> {
     if (!this.sessionDetails?.profile || getReferenceString(this.sessionDetails.profile) !== login.profile?.reference) {
-      this.clearActiveLogin();
+      this.clearActiveLoginState();
     }
-    this.setAccessToken(login.accessToken, login.refreshToken);
+    this.applyAccessToken(login.accessToken, login.refreshToken);
     this.storage.setObject('activeLogin', login);
     this.addLogin(login);
     this.refreshPromise = undefined;
@@ -3222,6 +3292,11 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
    * @category Authentication
    */
   setAccessToken(accessToken: string, refreshToken?: string): void {
+    this.invalidateSession();
+    this.applyAccessToken(accessToken, refreshToken);
+  }
+
+  private applyAccessToken(accessToken: string, refreshToken?: string): void {
     this.accessToken = accessToken;
     this.refreshToken = refreshToken;
     this.accessTokenExpires = tryGetJwtExpiration(accessToken);
@@ -3248,9 +3323,11 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
       return undefined;
     }
 
+    const version = this.sessionVersion;
     this.profilePromise = new Promise((resolve, reject) => {
       this.get('auth/me', { cache: 'no-cache' })
         .then((result: SessionDetails) => {
+          this.assertSessionVersion(version);
           this.profilePromise = undefined;
           const profileChanged = this.sessionDetails?.profile?.id !== result.profile.id;
           this.sessionDetails = result;
@@ -3584,11 +3661,15 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
    * @returns The response
    */
   async wrappedFetch(url: string, options: RequestInit): Promise<Response> {
+    const version = this.sessionVersion;
     await this.refreshIfExpired();
+    this.assertSessionVersion(version);
 
     this.addFetchOptionsDefaults(options, url);
 
-    return this.fetchWithRetry(url, options);
+    const response = await this.fetchWithRetry(url, options);
+    this.assertSessionVersion(version);
+    return response;
   }
 
   /**
@@ -3722,7 +3803,9 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
    * @returns The JSON content body if available.
    */
   private async request<T>(url: string, options: MedplumRequestOptions = {}, state: RequestState = {}): Promise<T> {
+    const version = this.sessionVersion;
     const response = await this.wrappedFetch(url, options);
+    this.assertSessionVersion(version);
 
     if (response.status === 401) {
       // Refresh and try again
@@ -3745,6 +3828,7 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
     }
 
     const body = await this.parseBody(response, isJson);
+    this.assertSessionVersion(version);
 
     if (
       (response.status === 200 && options.followRedirectOnOk) ||
@@ -4280,13 +4364,15 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
    * @returns Promise that resolves when the refresh (or short-circuit) is complete.
    */
   private async runRefreshWithLock(gracePeriod?: number, force = false): Promise<ProfileResource | undefined> {
+    const version = this.sessionVersion;
     const run = (): Promise<ProfileResource | undefined> => {
+      this.assertSessionVersion(version);
       // Re-read latest tokens from storage before hitting the network.
       // A peer tab may have completed a refresh while we were queued on the lock.
       const previousAccessToken = this.accessToken;
       const latest = this.getActiveLogin();
       if (latest?.accessToken && latest.accessToken !== this.accessToken) {
-        this.setAccessToken(latest.accessToken, latest.refreshToken);
+        this.applyAccessToken(latest.accessToken, latest.refreshToken);
       }
       // A forced refresh (401 recovery) skips the expiry short-circuit for the rejected
       // token, but still reuses a different token a peer already produced if it is valid.
@@ -4304,7 +4390,14 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
       }
 
       if (this.clientId && this.clientSecret) {
-        return this.startClientLogin(this.clientId, this.clientSecret);
+        return this.fetchTokens(
+          {
+            grant_type: OAuthGrantType.ClientCredentials,
+            client_id: this.clientId,
+            client_secret: this.clientSecret,
+          },
+          true
+        );
       }
 
       return Promise.resolve(undefined);
@@ -4656,9 +4749,14 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
    * Makes a POST request to the tokens endpoint.
    * See {@link https://openid.net/specs/openid-connect-core-1_0.html#TokenEndpoint | OpenID Connect Core 1.0 TokenEndpoint} for full details.
    * @param params - Token parameters.
+   * @param preserveSession - Whether client-credential renewal continues the current session.
    * @returns The user profile resource.
    */
-  private async fetchTokens(params: Record<string, string>): Promise<ProfileResource> {
+  private async fetchTokens(params: Record<string, string>, preserveSession = false): Promise<ProfileResource> {
+    if (!preserveSession && params.grant_type !== OAuthGrantType.RefreshToken) {
+      this.invalidateSession();
+    }
+    const version = this.sessionVersion;
     const formBody = new URLSearchParams(params);
     const headers: HeadersInit = { ...this.defaultHeaders, 'Content-Type': ContentType.FORM_URL_ENCODED };
     if (this.basicAuth) {
@@ -4684,16 +4782,20 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
     try {
       response = await this.fetchWithRetry(this.tokenUrl, options);
     } catch (err) {
-      this.refreshPromise = undefined;
+      if (this.storage.getString('sessionVersion') === version) {
+        this.refreshPromise = undefined;
+      }
       throw err;
     }
 
+    this.assertSessionVersion(version);
     if (!response.ok) {
       this.clearActiveLogin();
       this.onUnauthenticated?.();
       await this.handleTokenError(response);
     }
     const tokens = await response.json();
+    this.assertSessionVersion(version);
     await this.verifyTokens(tokens);
     return this.getProfile() as ProfileResource;
   }
@@ -4729,7 +4831,7 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
       }
     }
 
-    return this.setActiveLogin({
+    return this.applyActiveLogin({
       accessToken: token,
       refreshToken: tokens.refresh_token,
       project: tokens.project,
@@ -4761,17 +4863,25 @@ export class MedplumClient extends TypedEventTarget<MedplumClientEventMap> {
           locationUtils.reload();
         } else if (e.key === this.storage.makeKey('activeLogin')) {
           const oldState = (e.oldValue ? JSON.parse(e.oldValue) : undefined) as LoginState | undefined;
-          const newState = (e.newValue ? JSON.parse(e.newValue) : undefined) as LoginState | undefined;
+          // Events can be queued while a tab is suspended. Only current storage
+          // may supply credentials; event.newValue can describe an obsolete login.
+          const newState = this.getActiveLogin();
           if (
             oldState?.profile.reference !== newState?.profile.reference ||
             !this.checkSessionDetailsMatchLogin(newState)
           ) {
             locationUtils.reload();
           } else if (newState) {
-            this.setAccessToken(newState.accessToken, newState.refreshToken);
+            const version = this.storage.getString('sessionVersion');
+            if (this.sessionVersion !== version) {
+              this.refreshPromise = undefined;
+              this.profilePromise = undefined;
+              this.sessionClearedFrom = undefined;
+            }
+            this.sessionVersion = version;
+            this.applyAccessToken(newState.accessToken, newState.refreshToken);
           } else {
-            // Theoretically this should never be called, but we might want to keep it here just in case
-            this.clear();
+            this.clearActiveLoginState(false);
           }
         }
       });

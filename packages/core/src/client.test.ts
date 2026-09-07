@@ -3313,7 +3313,17 @@ describe('Client', () => {
     expect(mockAddEventListener).toHaveBeenCalled();
     expect(mockAddEventListener.mock.calls[0][0]).toBe('storage');
 
-    const callback = mockAddEventListener.mock.calls[0][1];
+    const callback = (event: Partial<StorageEvent>): void => {
+      // The browser updates storage before dispatching the event to peer tabs.
+      if (event.key === 'activeLogin') {
+        if (event.newValue === null) {
+          localStorage.removeItem('activeLogin');
+        } else if (event.newValue !== undefined) {
+          localStorage.setItem('activeLogin', event.newValue);
+        }
+      }
+      mockAddEventListener.mock.calls[0][1](event);
+    };
 
     mockReload.mockReset();
     callback({ key: 'randomKey' });
